@@ -296,7 +296,12 @@ class MarketDataProvider:
         :param connector_name: str
         :return: ConnectorBase
         """
-        conn_setting = self.conn_settings.get(connector_name)
+        # Paper trade connectors don't have their own module; use the base connector
+        base_name = connector_name
+        if connector_name.endswith("_paper_trade"):
+            base_name = connector_name.replace("_paper_trade", "")
+
+        conn_setting = self.conn_settings.get(base_name)
         if conn_setting is None:
             self.logger().error(f"Connector {connector_name} not found")
             raise ValueError(f"Connector {connector_name} not found")
@@ -304,9 +309,9 @@ class MarketDataProvider:
         init_params = conn_setting.conn_init_parameters(
             trading_pairs=[],
             trading_required=False,
-            api_keys=self.get_connector_config_map(connector_name),
+            api_keys=self.get_connector_config_map(base_name),
         )
-        connector_class = get_connector_class(connector_name)
+        connector_class = get_connector_class(base_name)
         connector = connector_class(**init_params)
         return connector
 

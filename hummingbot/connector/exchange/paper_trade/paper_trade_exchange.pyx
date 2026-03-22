@@ -1126,6 +1126,12 @@ cdef class PaperTradeExchange(ExchangeBase):
     def get_order_book(self, trading_pair: str) -> OrderBook:
         return self.c_get_order_book(trading_pair)
 
+    def set_leverage(self, trading_pair: str, leverage: int = 1):
+        pass
+
+    def set_position_mode(self, position_mode):
+        pass
+
     def get_maker_order_type(self):
         return OrderType.LIMIT
 

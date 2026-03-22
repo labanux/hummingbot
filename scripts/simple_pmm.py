@@ -7,7 +7,7 @@ from pydantic import Field
 
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, TradeType
-from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.data_type.order_candidate import OrderCandidate, PerpetualOrderCandidate
 from hummingbot.core.event.events import OrderFilledEvent
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base, StrategyV2ConfigBase
 
@@ -55,16 +55,25 @@ class SimplePMM(StrategyV2Base):
             self.place_orders(proposal_adjusted)
             self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
 
+    @property
+    def is_perpetual(self) -> bool:
+        return hasattr(self.connectors[self.config.exchange], "get_buy_collateral_token")
+
     def create_proposal(self) -> List[OrderCandidate]:
         ref_price = self.connectors[self.config.exchange].get_price_by_type(self.config.trading_pair, self.price_source)
         buy_price = ref_price * Decimal(1 - self.config.bid_spread)
         sell_price = ref_price * Decimal(1 + self.config.ask_spread)
 
-        buy_order = OrderCandidate(trading_pair=self.config.trading_pair, is_maker=True, order_type=OrderType.LIMIT,
-                                   order_side=TradeType.BUY, amount=Decimal(self.config.order_amount), price=buy_price)
-
-        sell_order = OrderCandidate(trading_pair=self.config.trading_pair, is_maker=True, order_type=OrderType.LIMIT,
-                                    order_side=TradeType.SELL, amount=Decimal(self.config.order_amount), price=sell_price)
+        if self.is_perpetual:
+            buy_order = PerpetualOrderCandidate(trading_pair=self.config.trading_pair, is_maker=True, order_type=OrderType.LIMIT,
+                                                order_side=TradeType.BUY, amount=Decimal(self.config.order_amount), price=buy_price)
+            sell_order = PerpetualOrderCandidate(trading_pair=self.config.trading_pair, is_maker=True, order_type=OrderType.LIMIT,
+                                                 order_side=TradeType.SELL, amount=Decimal(self.config.order_amount), price=sell_price)
+        else:
+            buy_order = OrderCandidate(trading_pair=self.config.trading_pair, is_maker=True, order_type=OrderType.LIMIT,
+                                       order_side=TradeType.BUY, amount=Decimal(self.config.order_amount), price=buy_price)
+            sell_order = OrderCandidate(trading_pair=self.config.trading_pair, is_maker=True, order_type=OrderType.LIMIT,
+                                        order_side=TradeType.SELL, amount=Decimal(self.config.order_amount), price=sell_price)
 
         return [buy_order, sell_order]
 
