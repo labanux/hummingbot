@@ -94,8 +94,15 @@ coverage.xml
 /**/.injective_cookie
 
 .env
+.compose.env
 
 **/.claude/settings.local.json
+
+# Local working files
+local-md/
+readme.txt
+scripts/lighter_testnet_verify.py
+scripts/lighter_testnet_results.json
 
 # Editor/AI tool directories
 .claude/
