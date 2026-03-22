@@ -102,21 +102,21 @@ class TestLighterPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCas
     # --- _request_order_book_snapshot ---
 
     async def test_request_order_book_snapshot(self):
-        expected = {"bids": [{"price": "2100", "size": "1"}], "asks": []}
+        expected = {"bids": [{"price": "2100", "remaining_base_amount": "1"}], "asks": []}
         self.connector._api_get = AsyncMock(return_value=expected)
         result = await self.data_source._request_order_book_snapshot("ETH-USD")
         self.assertEqual(expected, result)
         self.connector._api_get.assert_called_once_with(
-            path_url=CONSTANTS.ORDER_BOOK_URL,
-            params={"market_id": 0},
+            path_url=CONSTANTS.ORDER_BOOK_ORDERS_URL,
+            params={"market_id": 0, "limit": 100},
         )
 
     # --- _order_book_snapshot ---
 
     async def test_order_book_snapshot_message(self):
         self.connector._api_get = AsyncMock(return_value={
-            "bids": [{"price": "2100.00", "size": "1.5"}],
-            "asks": [{"price": "2101.00", "size": "2.0"}],
+            "bids": [{"price": "2100.00", "remaining_base_amount": "1.5"}],
+            "asks": [{"price": "2101.00", "remaining_base_amount": "2.0"}],
         })
         msg = await self.data_source._order_book_snapshot("ETH-USD")
         self.assertIsInstance(msg, OrderBookMessage)
@@ -131,8 +131,13 @@ class TestLighterPerpetualAPIOrderBookDataSource(unittest.IsolatedAsyncioTestCas
 
     # --- _channel_originating_message ---
 
-    def test_channel_routing_order_book(self):
+    def test_channel_routing_order_book_update(self):
         event = {"type": "update", "channel": "order_book:0"}
+        result = self.data_source._channel_originating_message(event)
+        self.assertEqual(self.data_source._diff_messages_queue_key, result)
+
+    def test_channel_routing_order_book_subscribed(self):
+        event = {"type": "subscribed/order_book", "channel": "order_book:0"}
         result = self.data_source._channel_originating_message(event)
         self.assertEqual(self.data_source._snapshot_messages_queue_key, result)
 

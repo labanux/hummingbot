@@ -58,9 +58,9 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             trading_required: bool = True,
             domain: str = CONSTANTS.DOMAIN,
     ):
-        self.lighter_api_key_index = int(lighter_perpetual_api_key_index)
+        self.lighter_api_key_index = int(lighter_perpetual_api_key_index) if lighter_perpetual_api_key_index else 0
         self.lighter_api_private_key = lighter_perpetual_api_private_key
-        self.lighter_account_index = int(lighter_perpetual_account_index)
+        self.lighter_account_index = int(lighter_perpetual_account_index) if lighter_perpetual_account_index else 0
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._domain = domain
@@ -69,6 +69,8 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         # Future-based correlation dict for order ID resolution
         self._order_id_futures: Dict[int, asyncio.Future] = {}
         self._next_client_order_idx = 1
+        # Lock to serialize SDK calls (create/cancel) to prevent nonce race conditions
+        self._sdk_lock = asyncio.Lock()
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # === Abstract Properties ===
@@ -301,22 +303,32 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         future = asyncio.get_event_loop().create_future()
         self._order_id_futures[client_order_index] = future
 
+        # For MARKET orders, price may be NaN — derive from order book with slippage
+        if order_type == OrderType.MARKET or price != price:  # NaN != NaN is True
+            ob_price = self.get_price(trading_pair, is_buy=(trade_type == TradeType.BUY))
+            slippage = Decimal(str(CONSTANTS.MARKET_ORDER_SLIPPAGE))
+            if trade_type == TradeType.BUY:
+                price = ob_price * (Decimal("1") + slippage)
+            else:
+                price = ob_price * (Decimal("1") - slippage)
+
         price_raw = to_raw_price(market_id, price)
         size_raw = to_raw_size(market_id, amount)
 
         reduce_only = position_action == PositionAction.CLOSE
 
-        # Call SDK's async create_order — handles sign + send + nonce atomically
-        tx, resp, err = await self._auth.signer.create_order(
-            market_index=market_id,
-            client_order_index=client_order_index,
-            base_amount=size_raw,
-            price=price_raw,
-            is_ask=(trade_type == TradeType.SELL),
-            order_type=CONSTANTS.LIGHTER_ORDER_TYPE[order_type],
-            time_in_force=CONSTANTS.LIGHTER_TIME_IN_FORCE[order_type],
-            reduce_only=reduce_only,
-        )
+        # Serialize SDK calls to prevent nonce race conditions
+        async with self._sdk_lock:
+            tx, resp, err = await self._auth.signer.create_order(
+                market_index=market_id,
+                client_order_index=client_order_index,
+                base_amount=size_raw,
+                price=price_raw,
+                is_ask=(trade_type == TradeType.SELL),
+                order_type=CONSTANTS.LIGHTER_ORDER_TYPE[order_type],
+                time_in_force=CONSTANTS.LIGHTER_TIME_IN_FORCE[order_type],
+                reduce_only=reduce_only,
+            )
         if err:
             self._order_id_futures.pop(client_order_index, None)
             raise IOError(f"Error submitting order {order_id}: {err}")
@@ -384,10 +396,11 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         market_id = pair_to_market_id(tracked_order.trading_pair)
         order_index = int(tracked_order.exchange_order_id)
 
-        tx, resp, err = await self._auth.signer.cancel_order(
-            market_index=market_id,
-            order_index=order_index,
-        )
+        async with self._sdk_lock:
+            tx, resp, err = await self._auth.signer.cancel_order(
+                market_index=market_id,
+                order_index=order_index,
+            )
         if err:
             if any(msg in err.lower() for msg in CONSTANTS.ORDER_NOT_FOUND_MESSAGES):
                 self.logger().debug(
@@ -410,13 +423,14 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
 
         market_id = pair_to_market_id(tracked_order.trading_pair)
         auth_token = self._auth.get_auth_token()
+        auth_headers = {"Authorization": auth_token}
         resp = await self._api_get(
             path_url=CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL,
             params={
                 "account_index": self.lighter_account_index,
                 "market_id": market_id,
-                "auth": auth_token,
             },
+            headers=auth_headers,
         )
 
         for order in resp.get("orders", []):
@@ -436,8 +450,8 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             params={
                 "account_index": self.lighter_account_index,
                 "market_id": market_id,
-                "auth": auth_token,
             },
+            headers=auth_headers,
         )
         for order in resp_inactive.get("orders", []):
             if str(order.get("order_index")) == str(exchange_order_id):
@@ -769,10 +783,12 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
 
     def _process_ws_assets(self, assets: Dict[str, Any]):
         """Update balances from WS account_all assets."""
+        if not assets:
+            return
         for asset_id, asset in assets.items():
             if not isinstance(asset, dict):
                 continue
-            if asset.get("symbol") == "USDC" or asset.get("asset_id") == 0:
+            if asset.get("symbol") == "USDC":
                 total = Decimal(str(asset.get("balance", "0")))
                 locked = Decimal(str(asset.get("locked_balance", "0")))
                 self._account_balances[CONSTANTS.CURRENCY] = total
@@ -804,24 +820,31 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             params={"by": "index", "value": self.lighter_account_index},
         )
         account = self._extract_account(resp)
-        # REST returns assets as a list: [{"symbol": "USDC", "asset_id": 0, "balance": "...", ...}]
+        # Prefer top-level collateral/available_balance (always present, asset_id-independent)
+        collateral = account.get("collateral")
+        available = account.get("available_balance")
+        if collateral is not None and available is not None:
+            self._account_balances[CONSTANTS.CURRENCY] = Decimal(str(collateral))
+            self._account_available_balances[CONSTANTS.CURRENCY] = Decimal(str(available))
+            return
+        # Fallback: scan assets list for USDC by symbol
         assets = account.get("assets", [])
         if isinstance(assets, list):
             for asset in assets:
                 if not isinstance(asset, dict):
                     continue
-                if asset.get("symbol") == "USDC" or asset.get("asset_id") == 0:
+                if asset.get("symbol") == "USDC":
                     total = Decimal(str(asset.get("balance", "0")))
                     locked = Decimal(str(asset.get("locked_balance", "0")))
                     self._account_balances[CONSTANTS.CURRENCY] = total
                     self._account_available_balances[CONSTANTS.CURRENCY] = total - locked
                     return
         elif isinstance(assets, dict):
-            # WS shape: {"0": {"symbol": "USDC", ...}}
+            # WS shape: {"asset_id_str": {"symbol": "USDC", ...}}
             for asset_id, asset in assets.items():
                 if not isinstance(asset, dict):
                     continue
-                if asset.get("symbol") == "USDC" or str(asset_id) == "0":
+                if asset.get("symbol") == "USDC":
                     total = Decimal(str(asset.get("balance", "0")))
                     locked = Decimal(str(asset.get("locked_balance", "0")))
                     self._account_balances[CONSTANTS.CURRENCY] = total
@@ -902,11 +925,12 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     async def _set_trading_pair_leverage(self, trading_pair: str, leverage: int) -> Tuple[bool, str]:
         market_id = pair_to_market_id(trading_pair)
         try:
-            tx, resp, err = await self._auth.signer.update_leverage(
-                market_index=market_id,
-                margin_mode=CONSTANTS.MARGIN_MODE_CROSS,
-                leverage=leverage,
-            )
+            async with self._sdk_lock:
+                tx, resp, err = await self._auth.signer.update_leverage(
+                    market_index=market_id,
+                    margin_mode=CONSTANTS.MARGIN_MODE_CROSS,
+                    leverage=leverage,
+                )
             if err:
                 return False, f"Error setting leverage: {err}"
             return True, ""

@@ -291,8 +291,8 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
             min_price_increment=Decimal("0.01"),
             min_base_amount_increment=Decimal("0.0001"),
             min_notional_size=Decimal("10.000000"),
-            buy_order_collateral_token="USDC",
-            sell_order_collateral_token="USDC",
+            buy_order_collateral_token="USD",
+            sell_order_collateral_token="USD",
         )
 
     @property
@@ -875,8 +875,8 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
 
         available_balances = self.exchange.available_balances
         total_balances = self.exchange.get_all_balances()
-        self.assertEqual(Decimal("9500"), available_balances["USDC"])
-        self.assertEqual(Decimal("10000"), total_balances["USDC"])
+        self.assertEqual(Decimal("9500"), available_balances["USD"])
+        self.assertEqual(Decimal("10000"), total_balances["USD"])
 
     def test_supported_position_modes(self):
         expected_result = [PositionMode.ONEWAY]
@@ -889,8 +889,8 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
                 min_order_size=Decimal("0.01"),
                 min_price_increment=Decimal("0.0001"),
                 min_base_amount_increment=Decimal("0.000001"),
-                buy_order_collateral_token="USDC",
-                sell_order_collateral_token="USDC",
+                buy_order_collateral_token="USD",
+                sell_order_collateral_token="USD",
             )
         }
 
@@ -898,8 +898,8 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
         self._simulate_trading_rules_initialized()
         buy_collateral_token = self.exchange.get_buy_collateral_token(self.trading_pair)
         sell_collateral_token = self.exchange.get_sell_collateral_token(self.trading_pair)
-        self.assertEqual("USDC", buy_collateral_token)
-        self.assertEqual("USDC", sell_collateral_token)
+        self.assertEqual("USD", buy_collateral_token)
+        self.assertEqual("USD", sell_collateral_token)
 
     @aioresponses()
     def test_set_leverage_failure(self, mock_api):

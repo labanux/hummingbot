@@ -19,7 +19,8 @@ TESTNET_WS_URL = "wss://testnet.zklighter.elliot.ai/stream"
 
 # REST API paths (all under /api/v1/)
 ORDER_BOOKS_URL = "/api/v1/orderBooks"
-ORDER_BOOK_URL = "/api/v1/orderBook"
+ORDER_BOOK_URL = "/api/v1/orderBook"  # deprecated — returns 403 on mainnet
+ORDER_BOOK_ORDERS_URL = "/api/v1/orderBookOrders"
 ORDER_BOOK_DETAILS_URL = "/api/v1/orderBookDetails"
 SEND_TX_URL = "/api/v1/sendTx"
 ACCOUNT_URL = "/api/v1/account"
@@ -30,7 +31,7 @@ FUNDINGS_URL = "/api/v1/fundings"
 NEXT_NONCE_URL = "/api/v1/nextNonce"
 HEALTH_CHECK_URL = "/api/v1/orderBooks"  # lightweight endpoint for connectivity check
 
-CURRENCY = "USDC"
+CURRENCY = "USD"
 
 FUNDING_RATE_UPDATE_INTERVAL_SECOND = 60
 
@@ -114,6 +115,8 @@ RATE_LIMITS = [
               linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
     RateLimit(limit_id=ORDER_BOOK_URL, limit=MAX_REQUEST, time_interval=60,
               linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
+    RateLimit(limit_id=ORDER_BOOK_ORDERS_URL, limit=MAX_REQUEST, time_interval=60,
+              linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
     RateLimit(limit_id=ORDER_BOOK_DETAILS_URL, limit=MAX_REQUEST, time_interval=60,
               linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
     RateLimit(limit_id=SEND_TX_URL, limit=MAX_REQUEST, time_interval=60,
@@ -121,6 +124,8 @@ RATE_LIMITS = [
     RateLimit(limit_id=ACCOUNT_URL, limit=MAX_REQUEST, time_interval=60,
               linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
     RateLimit(limit_id=ACCOUNT_ACTIVE_ORDERS_URL, limit=MAX_REQUEST, time_interval=60,
+              linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
+    RateLimit(limit_id=ACCOUNT_INACTIVE_ORDERS_URL, limit=MAX_REQUEST, time_interval=60,
               linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),
     RateLimit(limit_id=TRADES_URL, limit=MAX_REQUEST, time_interval=60,
               linked_limits=[LinkedLimitWeightPair(ALL_ENDPOINTS_LIMIT)]),

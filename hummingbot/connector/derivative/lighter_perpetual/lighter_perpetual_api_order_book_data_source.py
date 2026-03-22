@@ -91,16 +91,16 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
     async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
         market_id = pair_to_market_id(trading_pair)
         data = await self._connector._api_get(
-            path_url=CONSTANTS.ORDER_BOOK_URL,
-            params={"market_id": market_id},
+            path_url=CONSTANTS.ORDER_BOOK_ORDERS_URL,
+            params={"market_id": market_id, "limit": 100},
         )
         return data
 
     async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         snapshot_response = await self._request_order_book_snapshot(trading_pair)
         timestamp = time.time()
-        bids = [[float(b["price"]), float(b["size"])] for b in snapshot_response.get("bids", [])]
-        asks = [[float(a["price"]), float(a["size"])] for a in snapshot_response.get("asks", [])]
+        bids = [[float(b["price"]), float(b["remaining_base_amount"])] for b in snapshot_response.get("bids", [])]
+        asks = [[float(a["price"]), float(a["remaining_base_amount"])] for a in snapshot_response.get("asks", [])]
         snapshot_msg = OrderBookMessage(OrderBookMessageType.SNAPSHOT, {
             "trading_pair": trading_pair,
             "update_id": int(timestamp * 1e3),
@@ -143,7 +143,10 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
             return ""
 
         if CONSTANTS.WS_ORDER_BOOK_CHANNEL in msg_channel:
-            channel = self._snapshot_messages_queue_key
+            if "subscribed" in msg_type:
+                channel = self._snapshot_messages_queue_key
+            else:
+                channel = self._diff_messages_queue_key
         elif CONSTANTS.WS_MARKET_STATS_CHANNEL in msg_channel:
             channel = self._funding_info_messages_queue_key
         return channel
@@ -266,15 +269,14 @@ class LighterPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
         """Funding settlement occurs every 1 hour."""
         return int(((time.time() // 3600) + 1) * 3600)
 
-    async def _process_websocket_messages(self, websocket_assistant: WSAssistant, queue: asyncio.Queue):
+    async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
         # Start keepalive task alongside message processing
         keepalive_task = asyncio.ensure_future(self._keepalive_loop(websocket_assistant))
         try:
             while True:
                 try:
                     await super()._process_websocket_messages(
-                        websocket_assistant=websocket_assistant,
-                        queue=queue)
+                        websocket_assistant=websocket_assistant)
                 except asyncio.TimeoutError:
                     # Send pong on timeout to keep connection alive
                     pong_request = WSJSONRequest(payload={"type": "pong"})
