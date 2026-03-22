@@ -54,6 +54,7 @@ def main():
         "cryptography>=41.0.2",
         "eth-account>=0.13.0",
         "injective-py",
+        "lighter-sdk @ git+https://github.com/elliottech/lighter-python.git",
         "msgpack-python",
         "numba>=0.61.2",
         "numpy>=2.2.6",
