@@ -46,6 +46,7 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import (
     PositionExecutorConfig,
     TripleBarrierConfig,
 )
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executor_actions import (
     CreateExecutorAction,
     ExecutorAction,
@@ -315,6 +316,24 @@ class VRCSController(DirectionalTradingControllerBase):
                 if level.startswith("neutral_"):
                     stop_actions.append(StopExecutorAction(
                         controller_id=self.config.id, executor_id=p.id))
+
+        # 4) Kill executors stuck in a close-retry loop (e.g. position was
+        #    closed manually on the exchange so reduce_only orders keep failing)
+        shutting_down = self.filter_executors(
+            executors=self.executors_info,
+            filter_func=lambda x: x.is_active and x.status == RunnableStatus.SHUTTING_DOWN,
+        )
+        for ex in shutting_down:
+            retries = ex.custom_info.get("current_retries", 0)
+            max_retries = ex.custom_info.get("max_retries", 5)
+            if retries >= max_retries:
+                self.logger().warning(
+                    f"Force-stopping executor {ex.id}: stuck in close-retry loop "
+                    f"({retries}/{max_retries} retries). Position may have been "
+                    f"closed externally."
+                )
+                stop_actions.append(StopExecutorAction(
+                    controller_id=self.config.id, executor_id=ex.id))
 
         return stop_actions
 
