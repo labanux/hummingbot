@@ -16,7 +16,7 @@ from hummingbot.connector.derivative.lighter_perpetual.lighter_perpetual_derivat
 )
 from hummingbot.connector.test_support.perpetual_derivative_test import AbstractPerpetualDerivativeTests
 from hummingbot.connector.trading_rule import TradingRule
-from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, TradeType
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, TokenAmount, TradeFeeBase
 
@@ -1068,3 +1068,258 @@ class LighterPerpetualDerivativeTests(AbstractPerpetualDerivativeTests.Perpetual
     @aioresponses()
     def test_cancel_order_raises_failure_event_when_request_fails(self, mock_api):
         pass
+
+    # ----------------------------------------------------------------
+    # Tests for reduce-only CLOSE order fix (3 layers)
+    # ----------------------------------------------------------------
+
+    def _set_position(self, trading_pair: str, amount: Decimal, side: PositionSide = PositionSide.LONG):
+        """Helper: inject an open position into the connector's position tracking."""
+        from hummingbot.connector.derivative.position import Position
+        pos = Position(
+            trading_pair=trading_pair,
+            position_side=side,
+            unrealized_pnl=Decimal("0"),
+            entry_price=Decimal("2000"),
+            amount=amount,
+            leverage=Decimal("1"),
+        )
+        pos_key = self.exchange._perpetual_trading.position_key(trading_pair)
+        self.exchange._perpetual_trading.set_position(pos_key, pos)
+
+    def _clear_positions(self):
+        """Helper: remove all positions."""
+        self.exchange._perpetual_trading._account_positions.clear()
+
+    # --- Layer 1: Pre-flight position check ---
+
+    @aioresponses()
+    def test_place_reduce_only_order_fails_when_no_position(self, mock_api):
+        """Layer 1: _place_order should raise IOError for reduce_only when no position exists."""
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self._clear_positions()
+
+        with self.assertRaises(IOError) as ctx:
+            self.async_run_with_timeout(
+                self.exchange._place_order(
+                    order_id="test_close_order",
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("1"),
+                    trade_type=TradeType.SELL,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("2000"),
+                    position_action=PositionAction.CLOSE,
+                )
+            )
+        self.assertIn("no open position", str(ctx.exception))
+
+    @aioresponses()
+    def test_place_reduce_only_order_succeeds_when_position_exists(self, mock_api):
+        """Layer 1: _place_order should proceed normally for reduce_only when position exists."""
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self._set_position(self.trading_pair, Decimal("1"), PositionSide.LONG)
+
+        # SDK returns success and future resolves immediately
+        async def mock_place(*args, **kwargs):
+            return str(self.expected_exchange_order_id), self.exchange.current_timestamp
+
+        with patch.object(self.exchange, "_place_order", side_effect=mock_place):
+            order_id = self.place_sell_order(position_action=PositionAction.CLOSE)
+            self.async_run_with_timeout(asyncio.sleep(0.1))
+        self.assertIn(order_id, self.exchange.in_flight_orders)
+
+    @aioresponses()
+    def test_place_reduce_only_order_fails_when_position_amount_is_zero(self, mock_api):
+        """Layer 1: _place_order should fail for reduce_only when position amount is zero."""
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self._set_position(self.trading_pair, Decimal("0"), PositionSide.LONG)
+
+        with self.assertRaises(IOError) as ctx:
+            self.async_run_with_timeout(
+                self.exchange._place_order(
+                    order_id="test_close_zero",
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("1"),
+                    trade_type=TradeType.SELL,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("2000"),
+                    position_action=PositionAction.CLOSE,
+                )
+            )
+        self.assertIn("no open position", str(ctx.exception))
+
+    @aioresponses()
+    def test_place_open_order_works_without_position(self, mock_api):
+        """Layer 1: _place_order for OPEN should not be blocked by missing position."""
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self._clear_positions()
+
+        async def mock_place(*args, **kwargs):
+            return str(self.expected_exchange_order_id), self.exchange.current_timestamp
+
+        with patch.object(self.exchange, "_place_order", side_effect=mock_place):
+            order_id = self.place_buy_order(position_action=PositionAction.OPEN)
+            self.async_run_with_timeout(asyncio.sleep(0.1))
+        self.assertIn(order_id, self.exchange.in_flight_orders)
+
+    # --- Layer 2: Fast-fail for UNRESOLVED reduce-only ---
+
+    @aioresponses()
+    def test_unresolved_reduce_only_order_raises_immediately(self, mock_api):
+        """Layer 2: When WS + REST poll fail for reduce_only, raise IOError instead of UNRESOLVED."""
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+        self._set_position(self.trading_pair, Decimal("1"), PositionSide.LONG)
+
+        # SDK returns success but WS future never resolves and REST poll returns nothing
+        mock_resp = MagicMock()
+        mock_resp.code = 200
+        mock_resp.tx_hash = "mock_tx"
+        mock_resp.message = ""
+        self.exchange._auth.signer.create_order = AsyncMock(
+            return_value=(MagicMock(), mock_resp, None)
+        )
+
+        # Mock _poll_order_by_client_index to always return None (order not found)
+        with patch.object(self.exchange, "_poll_order_by_client_index", new_callable=AsyncMock, return_value=None):
+            with self.assertRaises(IOError) as ctx:
+                self.async_run_with_timeout(
+                    self.exchange._place_order(
+                        order_id="test_unresolved_close",
+                        trading_pair=self.trading_pair,
+                        amount=Decimal("1"),
+                        trade_type=TradeType.SELL,
+                        order_type=OrderType.LIMIT,
+                        price=Decimal("2000"),
+                        position_action=PositionAction.CLOSE,
+                    ),
+                    timeout=15,
+                )
+            self.assertIn("position may already be closed", str(ctx.exception))
+
+    @aioresponses()
+    def test_unresolved_open_order_returns_deferred_id(self, mock_api):
+        """Layer 2: Non-reduce_only orders should still return UNRESOLVED: synthetic ID."""
+        self._simulate_trading_rules_initialized()
+        self.exchange._set_current_timestamp(1640780000)
+
+        mock_resp = MagicMock()
+        mock_resp.code = 200
+        mock_resp.tx_hash = "mock_tx"
+        mock_resp.message = ""
+        self.exchange._auth.signer.create_order = AsyncMock(
+            return_value=(MagicMock(), mock_resp, None)
+        )
+
+        with patch.object(self.exchange, "_poll_order_by_client_index", new_callable=AsyncMock, return_value=None):
+            result = self.async_run_with_timeout(
+                self.exchange._place_order(
+                    order_id="test_unresolved_open",
+                    trading_pair=self.trading_pair,
+                    amount=Decimal("1"),
+                    trade_type=TradeType.BUY,
+                    order_type=OrderType.LIMIT,
+                    price=Decimal("2000"),
+                    position_action=PositionAction.OPEN,
+                ),
+                timeout=15,
+            )
+        exchange_order_id, _ = result
+        self.assertTrue(exchange_order_id.startswith("UNRESOLVED:"))
+
+    # --- Layer 3: Position-aware _request_order_status ---
+
+    @aioresponses()
+    def test_request_order_status_unresolved_no_position_returns_canceled(self, mock_api):
+        """Layer 3: UNRESOLVED order not found + no position → OrderUpdate with CANCELED."""
+        self._simulate_trading_rules_initialized()
+        self._clear_positions()
+
+        tracked_order = InFlightOrder(
+            client_order_id="test_close_tp",
+            exchange_order_id="UNRESOLVED:999",
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("2000"),
+            creation_timestamp=1640780000,
+        )
+
+        # Mock REST to return empty order lists
+        active_url = self._url(CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL)
+        inactive_url = self._url(CONSTANTS.ACCOUNT_INACTIVE_ORDERS_URL)
+        mock_api.get(re.compile(f"^{re.escape(inactive_url)}.*"),
+                     body=json.dumps({"code": 200, "orders": []}))
+        mock_api.get(re.compile(f"^{re.escape(active_url)}.*"),
+                     body=json.dumps({"code": 200, "orders": []}))
+
+        result = self.async_run_with_timeout(
+            self.exchange._request_order_status(tracked_order)
+        )
+        self.assertEqual(OrderState.CANCELED, result.new_state)
+        self.assertEqual("test_close_tp", result.client_order_id)
+
+    @aioresponses()
+    def test_request_order_status_unresolved_with_position_raises(self, mock_api):
+        """Layer 3: UNRESOLVED order not found + position exists → still raises IOError."""
+        self._simulate_trading_rules_initialized()
+        self._set_position(self.trading_pair, Decimal("1"), PositionSide.LONG)
+
+        tracked_order = InFlightOrder(
+            client_order_id="test_close_tp2",
+            exchange_order_id="UNRESOLVED:998",
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("2000"),
+            creation_timestamp=1640780000,
+        )
+
+        active_url = self._url(CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL)
+        inactive_url = self._url(CONSTANTS.ACCOUNT_INACTIVE_ORDERS_URL)
+        mock_api.get(re.compile(f"^{re.escape(inactive_url)}.*"),
+                     body=json.dumps({"code": 200, "orders": []}))
+        mock_api.get(re.compile(f"^{re.escape(active_url)}.*"),
+                     body=json.dumps({"code": 200, "orders": []}))
+
+        with self.assertRaises(IOError) as ctx:
+            self.async_run_with_timeout(
+                self.exchange._request_order_status(tracked_order)
+            )
+        self.assertIn("not found in active or inactive orders", str(ctx.exception))
+
+    @aioresponses()
+    def test_request_order_status_resolved_order_not_affected(self, mock_api):
+        """Layer 3: Regular (non-UNRESOLVED) orders should not be affected by position check."""
+        self._simulate_trading_rules_initialized()
+        self._clear_positions()  # No position, but order is resolved — should still raise
+
+        tracked_order = InFlightOrder(
+            client_order_id="test_resolved",
+            exchange_order_id="12345",
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.SELL,
+            amount=Decimal("1"),
+            price=Decimal("2000"),
+            creation_timestamp=1640780000,
+        )
+
+        active_url = self._url(CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL)
+        inactive_url = self._url(CONSTANTS.ACCOUNT_INACTIVE_ORDERS_URL)
+        mock_api.get(re.compile(f"^{re.escape(active_url)}.*"),
+                     body=json.dumps({"code": 200, "orders": []}))
+        mock_api.get(re.compile(f"^{re.escape(inactive_url)}.*"),
+                     body=json.dumps({"code": 200, "orders": []}))
+
+        with self.assertRaises(IOError) as ctx:
+            self.async_run_with_timeout(
+                self.exchange._request_order_status(tracked_order)
+            )
+        self.assertIn("not found in active or inactive orders", str(ctx.exception))

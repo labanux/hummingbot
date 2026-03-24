@@ -31,7 +31,7 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
 from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PositionSide, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 from hummingbot.core.data_type.perpetual_api_order_book_data_source import PerpetualAPIOrderBookDataSource
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
@@ -317,6 +317,22 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
 
         reduce_only = position_action == PositionAction.CLOSE
 
+        # Pre-flight check: don't send reduce_only orders when there's no position.
+        # Lighter silently rejects these (status "canceled-reduce-only") causing
+        # an UNRESOLVED order loop. Fail fast instead.
+        if reduce_only:
+            pos = self._perpetual_trading.get_position(trading_pair)
+            if pos is None or pos.amount == Decimal("0"):
+                self._order_id_futures.pop(client_order_index, None)
+                raise IOError(
+                    f"Cannot place reduce_only order {order_id}: "
+                    f"no open position for {trading_pair}"
+                )
+
+        # IOC/MARKET orders require order_expiry=0; LIMIT orders use default (-1 → 28 days)
+        is_ioc = order_type == OrderType.MARKET
+        order_expiry = self._auth.signer.DEFAULT_IOC_EXPIRY if is_ioc else self._auth.signer.DEFAULT_28_DAY_ORDER_EXPIRY
+
         # Serialize SDK calls to prevent nonce race conditions
         async with self._sdk_lock:
             tx, resp, err = await self._auth.signer.create_order(
@@ -328,54 +344,104 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
                 order_type=CONSTANTS.LIGHTER_ORDER_TYPE[order_type],
                 time_in_force=CONSTANTS.LIGHTER_TIME_IN_FORCE[order_type],
                 reduce_only=reduce_only,
+                order_expiry=order_expiry,
             )
         if err:
             self._order_id_futures.pop(client_order_index, None)
             raise IOError(f"Error submitting order {order_id}: {err}")
+        # SDK decorator may swallow API errors — check resp.code
+        if resp is not None and hasattr(resp, 'code') and resp.code != 200:
+            self._order_id_futures.pop(client_order_index, None)
+            msg = getattr(resp, 'message', 'unknown')
+            raise IOError(f"API rejected order {order_id}: code={resp.code} message={msg}")
 
         # Wait for WS to fire the order_index (with timeout).
         try:
             exchange_order_id = await asyncio.wait_for(future, timeout=10.0)
         except asyncio.TimeoutError:
             self._order_id_futures.pop(client_order_index, None)
-            # Fallback: poll REST for the order by client_order_index
-            exchange_order_id = await self._poll_order_by_client_index(
-                client_order_index, trading_pair
-            )
+            # Fallback: poll REST with retries
+            # MARKET/IOC orders fill immediately — use more retries with shorter delays
+            max_retries = 4 if is_ioc else 2
+            exchange_order_id = None
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    await self._sleep(1.5)
+                exchange_order_id = await self._poll_order_by_client_index(
+                    client_order_index, trading_pair, check_inactive_first=is_ioc,
+                )
+                if exchange_order_id is not None:
+                    break
             if exchange_order_id is None:
-                raise IOError(f"Timeout waiting for order_index from Lighter WS for {order_id}")
+                if reduce_only:
+                    # Reduce-only orders that can't be found were likely rejected
+                    # by Lighter (status "canceled-reduce-only"). Fail immediately
+                    # instead of creating a zombie UNRESOLVED order that loops for
+                    # ~32s before eventually failing anyway.
+                    raise IOError(
+                        f"Reduce-only order {order_id} not found on exchange — "
+                        f"position may already be closed"
+                    )
+                # Order was accepted by API (no err, resp.code==200) but we can't
+                # resolve the exchange order_index yet.  Return a synthetic ID so the
+                # order is tracked as OPEN and _request_order_status can resolve it
+                # later via client_order_index lookup.
+                self.logger().warning(
+                    f"Could not resolve exchange order_index for {order_id} "
+                    f"(client_order_index={client_order_index}). Using deferred resolution."
+                )
+                return f"UNRESOLVED:{client_order_index}", self.current_timestamp
 
         return str(exchange_order_id), self.current_timestamp
 
     async def _poll_order_by_client_index(self, client_order_index: int,
-                                           trading_pair: str) -> Optional[int]:
-        """Fallback REST poll when WS correlation times out."""
+                                           trading_pair: str,
+                                           check_inactive_first: bool = False) -> Optional[int]:
+        """Fallback REST poll when WS correlation times out.
+
+        :param check_inactive_first: If True, check inactive (filled) orders before
+            active orders. Useful for MARKET/IOC orders that fill immediately.
+        """
         try:
             market_id = pair_to_market_id(trading_pair)
             auth_token = self._auth.get_auth_token()
-            resp = await self._api_get(
-                path_url=CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL,
-                params={
+            auth_headers = {"Authorization": auth_token}
+
+            endpoints = [
+                (CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL, {
                     "account_index": self.lighter_account_index,
                     "market_id": market_id,
-                    "auth": auth_token,
-                },
-            )
-            for order in resp.get("orders", []):
-                if order.get("client_order_index") == client_order_index:
-                    return order["order_index"]
-            # Also check inactive orders (filled immediately)
-            resp_inactive = await self._api_get(
-                path_url=CONSTANTS.ACCOUNT_INACTIVE_ORDERS_URL,
-                params={
+                }),
+                (CONSTANTS.ACCOUNT_INACTIVE_ORDERS_URL, {
                     "account_index": self.lighter_account_index,
                     "market_id": market_id,
-                    "auth": auth_token,
-                },
+                    "limit": 100,
+                }),
+            ]
+            if check_inactive_first:
+                endpoints.reverse()
+
+            active_count = 0
+            inactive_count = 0
+            for url, params in endpoints:
+                resp = await self._api_get(
+                    path_url=url,
+                    params=params,
+                    headers=auth_headers,
+                )
+                orders = resp.get("orders", [])
+                if url == CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL:
+                    active_count = len(orders)
+                else:
+                    inactive_count = len(orders)
+                for order in orders:
+                    if int(order.get("client_order_index", -1)) == client_order_index:
+                        return order["order_index"]
+
+            self.logger().debug(
+                f"Order with client_order_index={client_order_index} not found in "
+                f"{active_count} active / {inactive_count} inactive orders"
             )
-            for order in resp_inactive.get("orders", []):
-                if order.get("client_order_index") == client_order_index:
-                    return order["order_index"]
         except Exception:
             self.logger().warning(
                 f"Error polling order by client_order_index {client_order_index}",
@@ -393,8 +459,23 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
             await self._order_tracker.process_order_not_found(order_id)
             return False
 
+        exchange_oid = tracked_order.exchange_order_id
+        # Resolve deferred exchange_order_id if needed
+        if str(exchange_oid).startswith("UNRESOLVED:"):
+            coi = int(str(exchange_oid).split(":")[1])
+            resolved = await self._poll_order_by_client_index(
+                coi, tracked_order.trading_pair, check_inactive_first=True,
+            )
+            if resolved is None:
+                self.logger().debug(
+                    f"Cannot cancel order {order_id}: exchange order ID still unresolved."
+                )
+                await self._order_tracker.process_order_not_found(order_id)
+                return False
+            exchange_oid = resolved
+
         market_id = pair_to_market_id(tracked_order.trading_pair)
-        order_index = int(tracked_order.exchange_order_id)
+        order_index = int(exchange_oid)
 
         async with self._sdk_lock:
             tx, resp, err = await self._auth.signer.cancel_order(
@@ -421,55 +502,81 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         except asyncio.TimeoutError:
             exchange_order_id = None
 
+        # Determine if we need to search by client_order_index (deferred resolution)
+        search_by_coi = False
+        client_order_index = None
+        if exchange_order_id and str(exchange_order_id).startswith("UNRESOLVED:"):
+            search_by_coi = True
+            client_order_index = int(str(exchange_order_id).split(":")[1])
+
         market_id = pair_to_market_id(tracked_order.trading_pair)
         auth_token = self._auth.get_auth_token()
         auth_headers = {"Authorization": auth_token}
-        resp = await self._api_get(
-            path_url=CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL,
-            params={
+
+        # For unresolved orders, check inactive first (MARKET/IOC orders fill immediately)
+        endpoints = [
+            (CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL, {
                 "account_index": self.lighter_account_index,
                 "market_id": market_id,
-            },
-            headers=auth_headers,
-        )
+            }),
+            (CONSTANTS.ACCOUNT_INACTIVE_ORDERS_URL, {
+                "account_index": self.lighter_account_index,
+                "market_id": market_id,
+                "limit": 100,
+            }),
+        ]
+        if search_by_coi:
+            endpoints.reverse()
 
-        for order in resp.get("orders", []):
-            if str(order.get("order_index")) == str(exchange_order_id):
-                new_state = CONSTANTS.lighter_status_to_hb_state(order["status"])
-                return OrderUpdate(
-                    trading_pair=tracked_order.trading_pair,
-                    update_timestamp=order.get("updated_at", time.time() * 1e3) * 1e-3,
-                    new_state=new_state,
-                    client_order_id=tracked_order.client_order_id,
-                    exchange_order_id=str(order["order_index"]),
+        for url, params in endpoints:
+            resp = await self._api_get(
+                path_url=url,
+                params=params,
+                headers=auth_headers,
+            )
+            for order in resp.get("orders", []):
+                matched = False
+                if search_by_coi:
+                    matched = int(order.get("client_order_index", -1)) == client_order_index
+                else:
+                    matched = str(order.get("order_index")) == str(exchange_order_id)
+                if matched:
+                    new_state = CONSTANTS.lighter_status_to_hb_state(order["status"])
+                    return OrderUpdate(
+                        trading_pair=tracked_order.trading_pair,
+                        update_timestamp=order.get("updated_at", time.time() * 1e3) * 1e-3,
+                        new_state=new_state,
+                        client_order_id=tracked_order.client_order_id,
+                        exchange_order_id=str(order["order_index"]),
+                    )
+
+        # Order not found in active or inactive lists.
+        # For UNRESOLVED orders: if no open position exists, the reduce-only order
+        # was silently rejected by Lighter. Return CANCELED so the executor stops
+        # retrying instead of looping for ~32s before marking as FAILED.
+        if search_by_coi:
+            pos = self._perpetual_trading.get_position(tracked_order.trading_pair)
+            if pos is None or pos.amount == Decimal("0"):
+                self.logger().info(
+                    f"UNRESOLVED order {tracked_order.client_order_id} not found and no open "
+                    f"position for {tracked_order.trading_pair} — marking as CANCELED."
                 )
-
-        # Check inactive orders (filled/canceled)
-        resp_inactive = await self._api_get(
-            path_url=CONSTANTS.ACCOUNT_INACTIVE_ORDERS_URL,
-            params={
-                "account_index": self.lighter_account_index,
-                "market_id": market_id,
-            },
-            headers=auth_headers,
-        )
-        for order in resp_inactive.get("orders", []):
-            if str(order.get("order_index")) == str(exchange_order_id):
-                new_state = CONSTANTS.lighter_status_to_hb_state(order["status"])
                 return OrderUpdate(
                     trading_pair=tracked_order.trading_pair,
-                    update_timestamp=order.get("updated_at", time.time() * 1e3) * 1e-3,
-                    new_state=new_state,
+                    update_timestamp=time.time(),
+                    new_state=OrderState.CANCELED,
                     client_order_id=tracked_order.client_order_id,
-                    exchange_order_id=str(order["order_index"]),
+                    exchange_order_id=tracked_order.exchange_order_id,
                 )
 
         raise IOError(f"Order {tracked_order.client_order_id} not found in active or inactive orders")
 
     async def _update_order_status(self):
+        await self._update_orders_fills(orders=list(self._order_tracker.all_fillable_orders.values()))
         await self._update_orders()
 
     async def _update_lost_orders_status(self):
+        await self._update_orders_fills(orders=list(self._order_tracker.lost_orders.values()))
         await self._update_lost_orders()
 
     # === Trade History ===
@@ -478,14 +585,22 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         trade_updates = []
         if order.exchange_order_id is None:
             return trade_updates
+        # Skip if exchange_order_id is still unresolved — can't query trades by COI
+        if str(order.exchange_order_id).startswith("UNRESOLVED:"):
+            return trade_updates
 
         try:
+            auth_token = self._auth.get_auth_token()
+            auth_headers = {"Authorization": auth_token}
             resp = await self._api_get(
                 path_url=CONSTANTS.TRADES_URL,
                 params={
                     "account_index": self.lighter_account_index,
                     "order_index": int(order.exchange_order_id),
+                    "sort_by": "timestamp",
+                    "limit": 100,
                 },
+                headers=auth_headers,
             )
             for trade in resp.get("trades", []):
                 trade_update = self._parse_trade_to_trade_update(trade, order)
