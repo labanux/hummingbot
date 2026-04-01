@@ -82,7 +82,7 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
     @property
     def authenticator(self) -> Optional[LighterPerpetualAuth]:
         if self._trading_required:
-            base_url = CONSTANTS.PERPETUAL_BASE_URL if self._domain == CONSTANTS.DOMAIN else CONSTANTS.TESTNET_BASE_URL
+            base_url = CONSTANTS.PERPETUAL_BASE_URL if self._domain in CONSTANTS.MAINNET_DOMAINS else CONSTANTS.TESTNET_BASE_URL
             return LighterPerpetualAuth(
                 api_key_index=self.lighter_api_key_index,
                 api_private_key=self.lighter_api_private_key,
@@ -335,17 +335,27 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
 
         # Serialize SDK calls to prevent nonce race conditions
         async with self._sdk_lock:
-            tx, resp, err = await self._auth.signer.create_order(
-                market_index=market_id,
-                client_order_index=client_order_index,
-                base_amount=size_raw,
-                price=price_raw,
-                is_ask=(trade_type == TradeType.SELL),
-                order_type=CONSTANTS.LIGHTER_ORDER_TYPE[order_type],
-                time_in_force=CONSTANTS.LIGHTER_TIME_IN_FORCE[order_type],
-                reduce_only=reduce_only,
-                order_expiry=order_expiry,
-            )
+            try:
+                tx, resp, err = await self._auth.signer.create_order(
+                    market_index=market_id,
+                    client_order_index=client_order_index,
+                    base_amount=size_raw,
+                    price=price_raw,
+                    is_ask=(trade_type == TradeType.SELL),
+                    order_type=CONSTANTS.LIGHTER_ORDER_TYPE[order_type],
+                    time_in_force=CONSTANTS.LIGHTER_TIME_IN_FORCE[order_type],
+                    reduce_only=reduce_only,
+                    order_expiry=order_expiry,
+                )
+            except Exception as sdk_exc:
+                # SDK decorator only catches BadRequestException for nonce rollback.
+                # Other exceptions (e.g. 429 ApiException) leave nonce incremented
+                # but unacknowledged. Roll back to prevent cascading nonce desync.
+                self._auth.signer.nonce_manager.acknowledge_failure(
+                    self.lighter_api_key_index
+                )
+                self._order_id_futures.pop(client_order_index, None)
+                raise IOError(f"Error submitting order {order_id}: {sdk_exc}") from sdk_exc
         if err:
             self._order_id_futures.pop(client_order_index, None)
             raise IOError(f"Error submitting order {order_id}: {err}")
@@ -478,10 +488,16 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         order_index = int(exchange_oid)
 
         async with self._sdk_lock:
-            tx, resp, err = await self._auth.signer.cancel_order(
-                market_index=market_id,
-                order_index=order_index,
-            )
+            try:
+                tx, resp, err = await self._auth.signer.cancel_order(
+                    market_index=market_id,
+                    order_index=order_index,
+                )
+            except Exception as sdk_exc:
+                self._auth.signer.nonce_manager.acknowledge_failure(
+                    self.lighter_api_key_index
+                )
+                raise IOError(f"Error cancelling order {order_id}: {sdk_exc}") from sdk_exc
         if err:
             if any(msg in err.lower() for msg in CONSTANTS.ORDER_NOT_FOUND_MESSAGES):
                 self.logger().debug(
@@ -572,12 +588,165 @@ class LighterPerpetualDerivative(PerpetualDerivativePyBase):
         raise IOError(f"Order {tracked_order.client_order_id} not found in active or inactive orders")
 
     async def _update_order_status(self):
-        await self._update_orders_fills(orders=list(self._order_tracker.all_fillable_orders.values()))
-        await self._update_orders()
+        # Batched: fetch once per market instead of once per order to avoid 429 rate limits
+        all_orders = list(self._order_tracker.all_fillable_orders.values())
+        await self._batched_update_fills_and_status(all_orders, is_lost=False)
 
     async def _update_lost_orders_status(self):
-        await self._update_orders_fills(orders=list(self._order_tracker.lost_orders.values()))
-        await self._update_lost_orders()
+        lost_orders = list(self._order_tracker.lost_orders.values())
+        await self._batched_update_fills_and_status(lost_orders, is_lost=True)
+
+    async def _batched_update_fills_and_status(self, orders: List[InFlightOrder], is_lost: bool):
+        """Fetch orders and trades once per market, then match to all in-flight orders.
+
+        This replaces the default per-order polling to stay within Lighter's rate limits.
+        Instead of 3N REST calls (N=orders), this makes 3M calls (M=markets, typically 1-2).
+        """
+        if not orders:
+            return
+
+        # Group orders by market_id
+        orders_by_market: Dict[int, List[InFlightOrder]] = {}
+        for order in orders:
+            try:
+                market_id = pair_to_market_id(order.trading_pair)
+            except KeyError:
+                continue
+            orders_by_market.setdefault(market_id, []).append(order)
+
+        auth_token = self._auth.get_auth_token()
+        auth_headers = {"Authorization": auth_token}
+
+        for market_id, market_orders in orders_by_market.items():
+            try:
+                # 1. Fetch all trades for this market (one call for all orders)
+                fillable = [o for o in market_orders
+                            if o.exchange_order_id and not str(o.exchange_order_id).startswith("UNRESOLVED:")]
+                if fillable:
+                    try:
+                        trades_resp = await self._api_get(
+                            path_url=CONSTANTS.TRADES_URL,
+                            params={
+                                "account_index": self.lighter_account_index,
+                                "market_id": market_id,
+                                "sort_by": "timestamp",
+                                "limit": 100,
+                            },
+                            headers=auth_headers,
+                        )
+                        # Build set of exchange_order_ids for fast lookup
+                        oid_to_order = {}
+                        for o in fillable:
+                            try:
+                                oid_to_order[int(o.exchange_order_id)] = o
+                            except (ValueError, TypeError):
+                                pass
+                        for trade in trades_resp.get("trades", []):
+                            # Match trade to order by ask_id or bid_id
+                            ask_id = trade.get("ask_id")
+                            bid_id = trade.get("bid_id")
+                            matched_order = oid_to_order.get(ask_id) or oid_to_order.get(bid_id)
+                            if matched_order:
+                                trade_update = self._parse_trade_to_trade_update(trade, matched_order)
+                                if trade_update:
+                                    self._order_tracker.process_trade_update(trade_update)
+                    except Exception as e:
+                        self.logger().warning(f"Failed to batch-fetch trades for market {market_id}: {e}")
+
+                # 2. Fetch active orders (one call per market)
+                active_resp = await self._api_get(
+                    path_url=CONSTANTS.ACCOUNT_ACTIVE_ORDERS_URL,
+                    params={
+                        "account_index": self.lighter_account_index,
+                        "market_id": market_id,
+                    },
+                    headers=auth_headers,
+                )
+                active_orders = active_resp.get("orders", [])
+
+                # 3. Fetch inactive orders (one call per market)
+                inactive_resp = await self._api_get(
+                    path_url=CONSTANTS.ACCOUNT_INACTIVE_ORDERS_URL,
+                    params={
+                        "account_index": self.lighter_account_index,
+                        "market_id": market_id,
+                        "limit": 100,
+                    },
+                    headers=auth_headers,
+                )
+                inactive_orders = inactive_resp.get("orders", [])
+
+                # 4. Match in-flight orders to API results
+                all_exchange_orders = active_orders + inactive_orders
+                for tracked in market_orders:
+                    # Orders with no exchange_order_id were rejected before reaching the
+                    # exchange (pre-flight IOError). They can never be matched here and
+                    # will be cleaned up by the failure-event path — skip to avoid spam.
+                    if not tracked.exchange_order_id:
+                        continue
+                    try:
+                        self._match_order_from_batch(tracked, all_exchange_orders, is_lost)
+                    except Exception as e:
+                        if is_lost:
+                            self.logger().debug(
+                                f"Error updating lost order {tracked.client_order_id}: {e}")
+                        else:
+                            self.logger().warning(
+                                f"Error fetching status update for the active order "
+                                f"{tracked.client_order_id}: {e}.")
+
+            except Exception as e:
+                self.logger().warning(f"Failed to batch-update orders for market {market_id}: {e}")
+
+    def _match_order_from_batch(self, tracked: InFlightOrder,
+                                 exchange_orders: List[Dict[str, Any]], is_lost: bool):
+        """Match a tracked order against the batch-fetched exchange orders."""
+        exchange_order_id = tracked.exchange_order_id
+        search_by_coi = False
+        client_order_index = None
+
+        if exchange_order_id and str(exchange_order_id).startswith("UNRESOLVED:"):
+            search_by_coi = True
+            client_order_index = int(str(exchange_order_id).split(":")[1])
+
+        for order in exchange_orders:
+            matched = False
+            if search_by_coi:
+                matched = int(order.get("client_order_index", -1)) == client_order_index
+            elif exchange_order_id:
+                matched = str(order.get("order_index")) == str(exchange_order_id)
+            if matched:
+                new_state = CONSTANTS.lighter_status_to_hb_state(order["status"])
+                order_update = OrderUpdate(
+                    trading_pair=tracked.trading_pair,
+                    update_timestamp=order.get("updated_at", time.time() * 1e3) * 1e-3,
+                    new_state=new_state,
+                    client_order_id=tracked.client_order_id,
+                    exchange_order_id=str(order["order_index"]),
+                )
+                self._order_tracker.process_order_update(order_update)
+                return
+
+        # Not found — handle UNRESOLVED orders with no position
+        if search_by_coi:
+            pos = self._perpetual_trading.get_position(tracked.trading_pair)
+            if pos is None or pos.amount == Decimal("0"):
+                self.logger().info(
+                    f"UNRESOLVED order {tracked.client_order_id} not found and no open "
+                    f"position for {tracked.trading_pair} — marking as CANCELED."
+                )
+                order_update = OrderUpdate(
+                    trading_pair=tracked.trading_pair,
+                    update_timestamp=time.time(),
+                    new_state=OrderState.CANCELED,
+                    client_order_id=tracked.client_order_id,
+                    exchange_order_id=tracked.exchange_order_id,
+                )
+                self._order_tracker.process_order_update(order_update)
+                return
+
+        if not is_lost:
+            raise IOError(f"Order {tracked.client_order_id} not found in active or inactive orders")
 
     # === Trade History ===
 

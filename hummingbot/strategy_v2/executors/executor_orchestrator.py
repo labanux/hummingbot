@@ -307,6 +307,16 @@ class ExecutorOrchestrator:
                     for executor in executors_list]):
                 continue
             await asyncio.sleep(2.0)
+        # Force-terminate any executors still running after the grace period
+        # to prevent orphaned control loops that spam errors after strategy stop
+        for controller_id, executors_list in self.active_executors.items():
+            for executor in executors_list:
+                if not executor.executor_info.is_done:
+                    self.logger().warning(
+                        f"Force-terminating executor {executor.executor_info.id} "
+                        f"(status: {executor.status}) — did not finish within grace period."
+                    )
+                    executor.stop()
         # Store all positions and executors
         self.store_all_positions()
         self.store_all_executors()

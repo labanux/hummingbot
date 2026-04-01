@@ -27,12 +27,12 @@ def public_rest_url(*args, **kwargs) -> str:
 
 
 def rest_url(path_url: str, domain: str = CONSTANTS.DOMAIN) -> str:
-    base_url = CONSTANTS.PERPETUAL_BASE_URL if domain == CONSTANTS.DOMAIN else CONSTANTS.TESTNET_BASE_URL
+    base_url = CONSTANTS.PERPETUAL_BASE_URL if domain in CONSTANTS.MAINNET_DOMAINS else CONSTANTS.TESTNET_BASE_URL
     return base_url + path_url
 
 
 def wss_url(domain: str = CONSTANTS.DOMAIN) -> str:
-    return CONSTANTS.PERPETUAL_WS_URL if domain == CONSTANTS.DOMAIN else CONSTANTS.TESTNET_WS_URL
+    return CONSTANTS.PERPETUAL_WS_URL if domain in CONSTANTS.MAINNET_DOMAINS else CONSTANTS.TESTNET_WS_URL
 
 
 def build_api_factory(

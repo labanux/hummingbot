@@ -133,10 +133,19 @@ class LighterPerpetualConfigMap(BaseConnectorConfigMap):
 
 KEYS = LighterPerpetualConfigMap.model_construct()
 
-OTHER_DOMAINS = ["lighter_perpetual_testnet"]
-OTHER_DOMAINS_PARAMETER = {"lighter_perpetual_testnet": "lighter_perpetual_testnet"}
-OTHER_DOMAINS_EXAMPLE_PAIR = {"lighter_perpetual_testnet": "BTC-USD"}
-OTHER_DOMAINS_DEFAULT_FEES = {"lighter_perpetual_testnet": [0, 0.01]}
+OTHER_DOMAINS = ["lighter_perpetual_testnet", "lighter_perpetual_b"]
+OTHER_DOMAINS_PARAMETER = {
+    "lighter_perpetual_testnet": "lighter_perpetual_testnet",
+    "lighter_perpetual_b": "lighter_perpetual_b",  # same mainnet, separate identity for dict keying
+}
+OTHER_DOMAINS_EXAMPLE_PAIR = {
+    "lighter_perpetual_testnet": "BTC-USD",
+    "lighter_perpetual_b": "BTC-USD",
+}
+OTHER_DOMAINS_DEFAULT_FEES = {
+    "lighter_perpetual_testnet": [0, 0.01],
+    "lighter_perpetual_b": [0, 0.01],
+}
 
 
 class LighterPerpetualTestnetConfigMap(BaseConnectorConfigMap):
@@ -171,6 +180,39 @@ class LighterPerpetualTestnetConfigMap(BaseConnectorConfigMap):
     model_config = ConfigDict(title="lighter_perpetual_testnet")
 
 
+class LighterPerpetualBConfigMap(BaseConnectorConfigMap):
+    connector: str = "lighter_perpetual_b"
+    lighter_perpetual_b_api_key_index: str = Field(
+        default="0",
+        json_schema_extra={
+            "prompt": "Enter your Lighter (B) API key index",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    lighter_perpetual_b_api_private_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your Lighter (B) API private key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    lighter_perpetual_b_account_index: str = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your Lighter (B) account index",
+            "is_secure": False,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        },
+    )
+    model_config = ConfigDict(title="lighter_perpetual_b")
+
+
 OTHER_DOMAINS_KEYS = {
-    "lighter_perpetual_testnet": LighterPerpetualTestnetConfigMap.model_construct()
+    "lighter_perpetual_testnet": LighterPerpetualTestnetConfigMap.model_construct(),
+    "lighter_perpetual_b": LighterPerpetualBConfigMap.model_construct(),
 }

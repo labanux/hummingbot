@@ -140,6 +140,8 @@ class VRCSController(DirectionalTradingControllerBase):
         self.config = config
         self.max_records = self.CANDLE_BUFFER + 50  # small margin
         super().__init__(config, *args, **kwargs)
+        # Populated by the strategy script with the hedge controller's executors
+        self.hedge_executors_info: list = []
 
     # -- candle feed registration ----------------------------------- #
 
@@ -239,13 +241,24 @@ class VRCSController(DirectionalTradingControllerBase):
         create_actions: List[ExecutorAction] = []
         signal = self.processed_data.get("signal", 0)
 
-        # --- check for any active position (filled order) ---
+        # --- check for any active position (filled or closing) ---
         active_positions = self.filter_executors(
             executors=self.executors_info,
             filter_func=lambda x: x.is_active and x.is_trading,
         )
-        if len(active_positions) > 0:
-            return create_actions  # position open — wait for exit
+        closing_positions = self.filter_executors(
+            executors=self.executors_info,
+            filter_func=lambda x: x.is_active and x.status == RunnableStatus.SHUTTING_DOWN,
+        )
+        if len(active_positions) > 0 or len(closing_positions) > 0:
+            return create_actions  # own position open or closing — wait for exit
+
+        # --- wait for hedge to close before starting a new cycle ---
+        # Check all active states: pending (market order not filled yet),
+        # trading (position open), and shutting_down (close order in progress)
+        hedge_busy = [e for e in self.hedge_executors_info if e.is_active]
+        if len(hedge_busy) > 0:
+            return create_actions  # hedge still open — wait for it to close
 
         mid = self.market_data_provider.get_price_by_type(
             self.config.connector_name, self.config.trading_pair, PriceType.MidPrice)
@@ -271,15 +284,15 @@ class VRCSController(DirectionalTradingControllerBase):
                     TradeType.SELL, entry_price, amount, "trend_short"))
         else:
             # NEUTRAL — passive PMM: buy behind, sell behind
-            # Split amount in half so both sides fit within budget
+            # Both sides placed but only one can fill (other is cancelled),
+            # so use full amount.
             if len(pending) == 0 and self._cooldown_ok():
-                half_amount = amount / Decimal("2")
                 buy_price = mid * (1 - self.config.buy_spread)
                 sell_price = mid * (1 + self.config.sell_spread)
                 create_actions.append(self._make_create_action(
-                    TradeType.BUY, buy_price, half_amount, "neutral_buy"))
+                    TradeType.BUY, buy_price, amount, "neutral_buy"))
                 create_actions.append(self._make_create_action(
-                    TradeType.SELL, sell_price, half_amount, "neutral_sell"))
+                    TradeType.SELL, sell_price, amount, "neutral_sell"))
 
         return create_actions
 

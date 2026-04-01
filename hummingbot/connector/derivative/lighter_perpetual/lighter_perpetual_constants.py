@@ -7,6 +7,8 @@ BROKER_ID = ""
 MAX_ORDER_ID_LEN = None  # Lighter uses integer client_order_index (uint48)
 
 DOMAIN = EXCHANGE_NAME
+DOMAIN_B = "lighter_perpetual_b"
+MAINNET_DOMAINS = {DOMAIN, DOMAIN_B}
 TESTNET_DOMAIN = "lighter_perpetual_testnet"
 
 # REST URLs

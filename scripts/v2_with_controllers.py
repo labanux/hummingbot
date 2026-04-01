@@ -45,6 +45,21 @@ class V2WithControllers(StrategyV2Base):
             self.control_max_drawdown()
             self.send_performance_report()
 
+    def update_executors_info(self):
+        """Refresh executor data, then cross-inject executors between paired controllers."""
+        super().update_executors_info()
+        for controller in self.controllers.values():
+            if hasattr(controller, "master_executors_info") and hasattr(controller.config, "master_controller_id"):
+                master_id = controller.config.master_controller_id
+                # Inject master executors into hedge controller
+                controller.master_executors_info = self.get_executors_by_controller(master_id)
+                controller.executors_update_event.set()
+                # Inject hedge executors into master controller
+                master = self.controllers.get(master_id)
+                if master and hasattr(master, "hedge_executors_info"):
+                    master.hedge_executors_info = self.get_executors_by_controller(controller.config.id)
+                    master.executors_update_event.set()
+
     def control_max_drawdown(self):
         if self.config.max_controller_drawdown_quote:
             self.check_max_controller_drawdown()

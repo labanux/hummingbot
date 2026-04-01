@@ -334,6 +334,21 @@ class PositionExecutor(ExecutorBase):
             elif self.open_and_close_volume_match():
                 self.stop()
             else:
+                # For perpetuals: if the exchange shows no open position the position was
+                # already closed (e.g. by TP fill or liquidation). Stop immediately instead
+                # of exhausting all retries with doomed reduce-only orders.
+                if self.is_perpetual:
+                    connector = self.connectors.get(self.config.connector_name)
+                    if connector and hasattr(connector, '_perpetual_trading'):
+                        pos = connector._perpetual_trading.get_position(self.config.trading_pair)
+                        if pos is None or pos.amount == Decimal("0"):
+                            self.logger().warning(
+                                f"Exchange position for {self.config.trading_pair} is 0 — "
+                                f"position already closed externally. Stopping executor "
+                                f"(close_type={self.close_type})."
+                            )
+                            self.stop()
+                            return
                 await self.control_close_order()
                 self._current_retries += 1
         else:
@@ -789,8 +804,18 @@ class PositionExecutor(ExecutorBase):
             )
         adjusted_order_candidates = self.adjust_order_candidates(self.config.connector_name, [order_candidate])
         if adjusted_order_candidates[0].amount == Decimal("0"):
+            connector = self.connectors[self.config.connector_name]
+            available = connector.available_balances
+            total = connector.get_all_balances()
+            self.logger().error(
+                f"Not enough budget to open position. "
+                f"Pair={self.config.trading_pair}, Side={self.config.side}, "
+                f"Amount={self.config.amount}, Price={self.entry_price}, "
+                f"Leverage={self.config.leverage}, "
+                f"Required collateral={self.config.amount * self.entry_price / Decimal(str(self.config.leverage)):.4f}, "
+                f"Available balances={dict(available)}, Total balances={dict(total)}"
+            )
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
             self.stop()
 
     async def _sleep(self, delay: float):

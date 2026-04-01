@@ -1,4 +1,5 @@
 import importlib
+import os
 from decimal import Decimal
 from enum import Enum
 from os import DirEntry, scandir
@@ -6,6 +7,8 @@ from os.path import exists, join
 from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Set, Union, cast
 
 from pydantic import SecretStr
+
+from pathlib import Path
 
 from hummingbot import get_strategy_list, root_path
 from hummingbot.connector.gateway.common_types import ConnectorType as GatewayConnectorType, get_connector_type
@@ -30,7 +33,7 @@ KEYFILE_POSTFIX = ".yml"
 ENCYPTED_CONF_POSTFIX = ".json"
 DEFAULT_LOG_FILE_PATH = root_path() / "logs"
 TEMPLATE_PATH = root_path() / "hummingbot" / "templates"
-CONF_DIR_PATH = root_path() / "conf"
+CONF_DIR_PATH = Path(os.environ["HUMMINGBOT_CONF_DIR"]) if "HUMMINGBOT_CONF_DIR" in os.environ else root_path() / "conf"
 CLIENT_CONFIG_PATH = CONF_DIR_PATH / "conf_client.yml"
 TRADE_FEES_CONFIG_PATH = CONF_DIR_PATH / "conf_fee_overrides.yml"
 STRATEGIES_CONF_DIR_PATH = CONF_DIR_PATH / "strategies"
